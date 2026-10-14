@@ -48,6 +48,7 @@ bash tests/nightly-channel.sh
 python3 tests/test-nightly-migration.py
 bash tests/pool-runtime.sh
 bash tests/shared-capacity.sh
+bash tests/resume-queued.sh
 bash tests/shared-observation.sh
 bash tests/elastic-pools.sh
 bash tests/queued-pools.sh
@@ -65,6 +66,7 @@ bash tests/provider-mocks.sh
 bash tests/shared-cache.sh
 bash tests/retired-docker-cache.sh
 bash tests/completed-docker-cache.sh
+bash tests/job-docker-cache.sh
 bash tests/pnpm-cache.sh
 bash tests/lease-selfheal.sh
 bash tests/ownership-safety.sh

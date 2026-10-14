@@ -817,21 +817,25 @@ autoscale_tick() {
   if pool_mode_enabled; then
     validate_runner_mode || return 1
     pool_activate build || return 1
-    # Rate-limit the entire remote planning pass, including native per-owner
-    # reads before queue scanning. Failed scans and daemon restarts retain the
-    # same cooldown; local cleanup and running workloads remain independent.
+    # Bound native registration reads across restarts independently of queue
+    # quota. A queue-reader cooldown must not strand completed owner grants.
     if [ "$QUEUED_POOLS" = true ] && printf '%s' "$RUNNER_POOLS" | grep -qiE '(^|[|,])general-build([|,;]|$)'; then
-      php "$SCRIPT_DIR/build-demand.php" begin "$CFGDIR" "$RUNDIR" "$RUNNER_POOLS" >/dev/null || return 75
+      php "$SCRIPT_DIR/build-demand.php" begin-recovery "$CFGDIR" "$RUNDIR" "$RUNNER_POOLS" >/dev/null || return 75
     fi
-    # Restore the static warm total before queue scans or owned withdrawal
-    # settlement. The normal start still requires the sole broker's admission.
-    restore_warm_capacity || return 1
-    shared_capacity_poison_scan || err "shared capacity: poison scan unavailable; preserving existing owner intents"
+    restore_warm_capacity || err "shared capacity: warm restoration incomplete; settling existing owners"
     if shared_capacity_call rebalance; then :; else
       # Unknown recovery retains its charged grant. Independent starts still
       # require the broker, so one unproved owner must not stall the fleet.
       [ "$?" -eq 75 ] || err "shared capacity: rebalance incomplete; retaining allocations and retrying gated starts"
     fi
+    # Queued starts can return healthy waiting before settlement frees grants.
+    # Retry warm restoration before a queue cooldown can defer burst planning.
+    restore_warm_capacity || return 1
+    # Preserve the broad queue cooldown without coupling it to owner recovery.
+    if [ "$QUEUED_POOLS" = true ] && printf '%s' "$RUNNER_POOLS" | grep -qiE '(^|[|,])general-build([|,;]|$)'; then
+      php "$SCRIPT_DIR/build-demand.php" begin "$CFGDIR" "$RUNDIR" "$RUNNER_POOLS" >/dev/null || return 75
+    fi
+    shared_capacity_poison_scan || err "shared capacity: poison scan unavailable; preserving existing owner intents"
     # The shared broker, rather than local count arithmetic, owns admission.
     # Retrying every stable slot preserves queue age and repairs inert creates.
     start_configured_capacity
@@ -2041,6 +2045,32 @@ clear_args_tmpdir() {
   esac
   rm -rf "${resolved:?}" 2>/dev/null \
     || { err "could not remove temporary argv dir '$dir'"; return 1; }
+}
+
+# Retry one existing queued owner without requiring a new queue scan. The native
+# controller retains its pending age and authorizes every create/start effect.
+cmd_resume_queued() {
+  shared_capacity_require_starts_open || return 1
+  shared_capacity_enabled && [ "$QUEUED_POOLS" = true ] || return 1
+  validate_runner_mode || return 1
+  local name="$1" snapshot id provider role idx generation current_generation pool state
+  snapshot="$(managed_runner_snapshot "$name")" || return 1
+  IFS='|' read -r id provider role idx generation <<< "$snapshot"
+  [ "$provider" = github ] && [ "$role" = runner ] || return 1
+  state="$(docker inspect -f '{{.State.Status}}' "$id")" || return 1
+  [ "$state" = created ] || { err "queued resume requires a never-started owner"; return 1; }
+  pool="$(runner_pool "$name")" || return 1
+  pool_activate "$pool" || return 1
+  current_generation="$(crf_confgen)" || return 1
+  [ -n "$current_generation" ] || return 1
+  if [ "$generation" != "$current_generation" ]; then
+    provision_base || return 1
+    firewall_prepare_replacement || return 1
+    shared_capacity_call refresh-queued "$name" "$id" || return 1
+    provider_call start_one "$idx" "$name"
+    return $?
+  fi
+  shared_capacity_start "$name" "$id"
 }
 
 start_one() {
@@ -4420,6 +4450,7 @@ case "${1:-status}" in
   shared-prepare) with_fleet_lock wait cmd_shared_prepare ;;
   shared-adopt) with_fleet_lock wait cmd_shared_adopt ;;
   shared-activate) with_fleet_lock wait cmd_shared_activate ;;
+  resume-queued) with_fleet_lock wait cmd_resume_queued "${2:?usage: resume-queued <name>}" ;;
   start)        with_fleet_lock wait cmd_start ;;
   boot-autostart)   cmd_boot_autostart ;;
   docker-stopping)  cmd_docker_stopping ;;
