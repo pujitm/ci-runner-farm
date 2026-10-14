@@ -6,7 +6,18 @@ github_token_ready() { [ -n "$ACCESS_TOKEN" ]; }
 github_token_name()  { echo "GitHub token"; }
 github_builtin_image() { echo "$BUILTIN_IMAGE"; }
 github_validate_settings() {
-  crf_validate_user_share_mounts && crf_shared_cache_mount
+  github_validate_docker_cache_policy && crf_validate_user_share_mounts && crf_shared_cache_mount
+}
+github_validate_docker_cache_policy() {
+  [ "$DIND" = true ] && [ "$EPHEMERAL" = false ] && [ -n "${DOCKER_CACHE_BUILDERS:-}" ] || return 0
+  local -a pressure_builders
+  [ "${#DOCKER_CACHE_BUILDERS}" -le 1024 ] && [[ "$DOCKER_CACHE_BUILDERS" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}(,[A-Za-z0-9][A-Za-z0-9_.-]{0,63})*$ ]] \
+    || { err "invalid Docker cache builder allowlist"; return 1; }
+  [[ "$DOCKER_CACHE_MIN_FREE_PERCENT" =~ ^(0|[1-9][0-9]?|100)$ ]] \
+    || { err "invalid Docker cache free-space threshold"; return 1; }
+  IFS=, read -r -a pressure_builders <<< "$DOCKER_CACHE_BUILDERS"
+  [ "${#pressure_builders[@]}" -le 32 ] \
+    || { err "too many Docker cache builder names"; return 1; }
 }
 github_strict_endpoint() { return 0; }
 github_imageupdate_pull() { return 1; }
@@ -34,6 +45,7 @@ github_confgen() {
   [ "$DIND" = true ] && runtime_salt='github-dind-cgroupns-v1'
   if [ "$DIND" = true ] && [ "$EPHEMERAL" = false ]; then
     runtime_salt="${runtime_salt}-job-cache-cleanup-v1"
+    [ -z "${DOCKER_CACHE_BUILDERS:-}" ] || runtime_salt="${runtime_salt}-cache-pressure-v1-${DOCKER_CACHE_MIN_FREE_PERCENT:-15}-${DOCKER_CACHE_BUILDERS}"
   fi
   # The explicit store contract must replace existing slots through the normal
   # drain lifecycle. Farms without a pnpm-store mount keep their fingerprint.
@@ -643,6 +655,11 @@ github_build_args() {
       ARGS+=( -e "CRF_IMAGE_JOB_COMPLETED_HOOK=$image_hook" )
       ARGS+=( -v "$cleanup_script:$cleanup_destination:ro"
         -e "ACTIONS_RUNNER_HOOK_JOB_COMPLETED=$cleanup_destination" -e CRF_JOB_CLEANUP_DIND=1 )
+      if [ -n "${DOCKER_CACHE_BUILDERS:-}" ]; then
+        github_validate_docker_cache_policy || return 1
+        ARGS+=( -e "CRF_DOCKER_CACHE_BUILDERS=$DOCKER_CACHE_BUILDERS"
+          -e "CRF_DOCKER_CACHE_MIN_FREE_PERCENT=$DOCKER_CACHE_MIN_FREE_PERCENT" )
+      fi
     fi
   elif [ "$SHARE_DOCKER_SOCK" = "true" ]; then
     ARGS+=( -v /var/run/docker.sock:/var/run/docker.sock )
